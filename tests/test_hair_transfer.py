@@ -91,6 +91,42 @@ class HairTransferTests(unittest.TestCase):
         np.testing.assert_array_equal(out, frame)
 
 
+class HeadLockAndEarsTests(unittest.TestCase):
+    @staticmethod
+    def _kps(mouth_drop=0.0, pitch=1.0, ed=60.0, cx=320.0, cy=260.0):
+        k = np.array([[-0.5, 0], [0.5, 0], [0, 0.6], [-0.4, 1.15], [0.4, 1.15]])
+        k[:, 1] *= pitch
+        k[3:, 1] += mouth_drop
+        return (k * ed + [cx, cy]).astype(np.float32)
+
+    def test_hair_does_not_move_when_talking_smiling_or_nodding(self):
+        src = self._kps()
+        crown = np.array([320.0, 260.0 - 2.4 * 60])
+        for k in (self._kps(mouth_drop=0.2), self._kps(pitch=0.85)):
+            A = ht._head_transform(src, k)
+            self.assertLess(np.linalg.norm(A[:, :2] @ crown + A[:, 2] - crown), 0.5)
+            self.assertAlmostEqual(float(np.sqrt(np.linalg.det(A[:, :2]))), 1.0, places=3)
+
+    def test_hair_scales_with_distance(self):
+        A = ht._head_transform(self._kps(), self._kps(ed=90.0))
+        self.assertAlmostEqual(float(np.sqrt(np.linalg.det(A[:, :2]))), 1.5, places=3)
+
+    def test_finds_ears_and_bangs_in_picture(self):
+        img, kps, hair_gt = portrait()
+        ears = np.zeros(img.shape[:2], np.uint8)
+        for sgn in (-1, 1):
+            cv2.ellipse(ears, (int(320 + sgn * 67), 305), (19, 30), 0, 0, 360, 255, -1)
+        face = np.zeros_like(ears)
+        cv2.ellipse(face, (320, 281), (63, 84), 0, 0, 360, 255, -1)
+        ears_only = (ears > 0) & (face == 0)
+        img[ears_only] = (110, 140, 195)
+        hair_gt &= ~ears_only
+        found = ht.segment_ears(img, kps, ht.segment_hair(img, kps)) > 127
+        self.assertGreater(iou(found, ears_only), 0.6)
+        layer = ht.build_layer(img, kps)
+        self.assertIsNotNone(layer.ears)
+
+
 class HideRealHairTests(unittest.TestCase):
     def _scene(self):
         rng = np.random.default_rng(5)

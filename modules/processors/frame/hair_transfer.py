@@ -34,13 +34,16 @@ _CACHE: dict = {"key": None, "layer": None}
 
 
 class HairLayer:
-    __slots__ = ("bgr", "alpha", "kps", "levels")
+    __slots__ = ("bgr", "alpha", "kps", "levels", "ears", "skin_lab", "_shift")
 
     def __init__(self, bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray):
         self.bgr = bgr      # HxWx3 uint8, cropped around the hair
         self.alpha = alpha  # HxW uint8, feathered hair mask
         self.kps = kps      # 5x2 float32 source keypoints in crop coords
         self.levels = {}    # n -> (bgr, alpha) shrunk by 2**-n (cached)
+        self.ears = None    # optional HairLayer with the picture's ears
+        self.skin_lab = None  # source cheek colour (Lab), for recolouring ears
+        self._shift = None  # smoothed per-frame ear colour shift
 
     def level(self, n: int):
         if n <= 0:
@@ -69,6 +72,90 @@ def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     scale = (S * np.diag(D)).sum() / max(var_s, 1e-9)
     t = mu_d - scale * R @ mu_s
     return np.hstack([scale * R, t[:, None]]).astype(np.float32)
+
+
+def _head_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Similarity (2x3) that keeps the picture's hair/ears locked to the skull.
+
+    Anchored on the eyes (they move with the skull; the mouth moves when
+    you talk or smile). Size comes from the eye distance, or from the
+    eye-to-nose-tip distance when the eyes look closer together because the
+    head is turned, so the hair doesn't pump in size when you talk, smile,
+    nod or turn.
+    """
+    src = np.asarray(src, np.float64)
+    dst = np.asarray(dst, np.float64)
+    se, de = (src[0] + src[1]) / 2, (dst[0] + dst[1]) / 2
+    sv, dv = src[1] - src[0], dst[1] - dst[0]
+    s_eye = np.linalg.norm(dv) / max(np.linalg.norm(sv), 1e-6)
+    s_nose = np.linalg.norm(dst[2] - de) / max(np.linalg.norm(src[2] - se), 1e-6)
+    scale = max(s_eye, s_nose / 1.05)
+    ang = np.arctan2(dv[1], dv[0]) - np.arctan2(sv[1], sv[0])
+    R = scale * np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    t = de - R @ se
+    return np.hstack([R, t[:, None]]).astype(np.float32)
+
+
+def _normaliser(kps: np.ndarray, eye_px: float = 64.0) -> np.ndarray:
+    """Affine taking the photo to upright face space (eye centre (192,160))."""
+    kps = np.asarray(kps, np.float32)
+    eye_c = (kps[0] + kps[1]) / 2
+    eye_d = float(np.linalg.norm(kps[1] - kps[0]))
+    angle = np.degrees(np.arctan2(kps[1][1] - kps[0][1], kps[1][0] - kps[0][0]))
+    M = cv2.getRotationMatrix2D((float(eye_c[0]), float(eye_c[1])), angle, eye_px / max(eye_d, 1e-6))
+    M[:, 2] += np.array([192.0, 160.0]) - eye_c
+    return M
+
+
+def _cheek_skin(norm_bgr: np.ndarray) -> Optional[np.ndarray]:
+    """Median skin colour (YCrCb) from the cheeks in upright face space."""
+    ycc = cv2.cvtColor(norm_bgr, cv2.COLOR_BGR2YCrCb)
+    px = np.concatenate([ycc[200:226, 140:166].reshape(-1, 3), ycc[200:226, 218:244].reshape(-1, 3)])
+    return np.median(px, axis=0) if len(px) else None
+
+
+def segment_ears(image: np.ndarray, kps: np.ndarray,
+                 hair_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """uint8 mask (0/255) of the picture's visible ears (skin beside the face)."""
+    kps = np.asarray(kps, np.float32)
+    if float(np.linalg.norm(kps[1] - kps[0])) < 8:
+        return np.zeros(image.shape[:2], np.uint8)
+    M = _normaliser(kps)
+    N = 384
+    norm = cv2.warpAffine(image, M, (N, N), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    inside = cv2.warpAffine(np.full(image.shape[:2], 255, np.uint8), M, (N, N),
+                            flags=cv2.INTER_NEAREST, borderValue=0) > 0
+    skin0 = _cheek_skin(norm)
+    if skin0 is None:
+        return np.zeros(image.shape[:2], np.uint8)
+    ycc = cv2.cvtColor(norm, cv2.COLOR_BGR2YCrCb).astype(np.int16)
+    skin = ((np.abs(ycc[..., 1] - skin0[1]) < 12) & (np.abs(ycc[..., 2] - skin0[2]) < 14)
+            & (np.abs(ycc[..., 0] - skin0[0]) < 70) & inside)
+    zone = np.zeros((N, N), np.uint8)
+    # Beside the face (beyond ~1.2 eye distances from the middle), between
+    # eyebrow and mouth height: where ears are.
+    cv2.rectangle(zone, (192 - 125, 140), (192 - 70, 250), 255, -1)
+    cv2.rectangle(zone, (192 + 70, 140), (192 + 125, 250), 255, -1)
+    ears = (skin & (zone > 0)).astype(np.uint8) * 255
+    if hair_mask is not None:
+        hm = cv2.warpAffine(hair_mask, M, (N, N), flags=cv2.INTER_NEAREST, borderValue=0)
+        ears[hm > 127] = 0
+    ears = cv2.morphologyEx(ears, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    ears = cv2.morphologyEx(ears, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(ears)
+    keep = np.zeros_like(ears)
+    for i in range(1, n):
+        x, w_ = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_WIDTH]
+        # an ear is attached to the side of the head: the blob must reach the
+        # zone's inner edge (next to the face), not float in the background
+        if x < 192:
+            touches_face_side = x + w_ >= 192 - 70 - 2
+        else:
+            touches_face_side = x <= 192 + 70 + 2
+        if stats[i, cv2.CC_STAT_AREA] >= 120 and touches_face_side:
+            keep[lab == i] = 255
+    return cv2.warpAffine(keep, cv2.invertAffineTransform(M), (image.shape[1], image.shape[0]),
+                          flags=cv2.INTER_LINEAR, borderValue=0)
 
 
 def segment_hair(image: np.ndarray, kps: np.ndarray) -> np.ndarray:
@@ -102,9 +189,16 @@ def segment_hair(image: np.ndarray, kps: np.ndarray) -> np.ndarray:
     cv2.rectangle(gc, (192 - 118, 125), (192 - 68, int(mouth_y) + 40), cv2.GC_PR_FGD, -1)  # sides
     cv2.rectangle(gc, (192 + 68, 125), (192 + 118, int(mouth_y) + 40), cv2.GC_PR_FGD, -1)
     cv2.ellipse(gc, (192, 72), (55, 22), 0, 0, 360, cv2.GC_FGD, -1)  # top of head
-    # Face skin is definitely not hair (also teaches GrabCut the skin colour).
+    # The forehead may be skin or a fringe/bangs: let GrabCut decide there
+    # (skin is removed again by the colour check). Only the face below the
+    # eyebrows is definitely not hair (also teaches GrabCut the skin colour).
     cv2.ellipse(gc, (192, int((160 + mouth_y) / 2)), (58, int(mouth_y - 160) + 30),
+                0, 0, 360, cv2.GC_PR_BGD, -1)
+    cv2.ellipse(gc, (192, int((160 + mouth_y) / 2) + 8), (54, int(mouth_y - 160) + 6),
                 0, 0, 360, cv2.GC_BGD, -1)
+    brow = np.zeros((N, N), np.uint8)
+    cv2.ellipse(brow, (192, 160), (62, 70), 0, 180, 360, 255, -1)   # forehead band
+    gc[(brow > 0) & (gc == cv2.GC_BGD)] = cv2.GC_PR_BGD
     # Neck/shoulders straight below the chin: probably not hair.
     cv2.rectangle(gc, (192 - 50, int(mouth_y) + 20), (192 + 50, N), cv2.GC_PR_BGD, -1)
     gc[~inside] = cv2.GC_BGD
@@ -178,14 +272,17 @@ def _drop_background_colours(norm: np.ndarray, fg: np.ndarray, bg_px: np.ndarray
     N = norm.shape[0]
     lab = cv2.cvtColor(norm, cv2.COLOR_BGR2LAB).astype(np.float32)
     crown = np.zeros((N, N), np.uint8)
-    cv2.ellipse(crown, (192, 92), (60, 32), 0, 0, 360, 255, -1)  # just above the forehead
+    cv2.ellipse(crown, (192, 68), (58, 22), 0, 0, 360, 255, -1)  # top of the head, above any hairline
     hair_seed = (crown > 0) & (cv2.erode(fg, np.ones((9, 9), np.uint8)) > 0)
     if hair_seed.sum() < 80 or len(bg_px) < 200:
         return fg
     # Main hair colours only: a background object touching the top of the
     # head would otherwise sneak in as a minor "hair" colour.
     hair_c = _kmeans_centres(lab[hair_seed], 4, min_share=0.2)
-    bg_c = _kmeans_centres(bg_px, 12)
+    # Face skin (cheeks) counts as "not hair" too, so the forehead isn't
+    # taken as hair now that fringes/bangs are allowed there.
+    cheeks = np.concatenate([lab[200:226, 140:166].reshape(-1, 3), lab[200:226, 218:244].reshape(-1, 3)])
+    bg_c = np.concatenate([_kmeans_centres(bg_px, 12), _kmeans_centres(cheeks, 2)])
     cand = fg > 0
     px = lab[cand]
     d_h = np.min(np.linalg.norm(px[:, None, :] - hair_c[None], axis=2), axis=1)
@@ -199,7 +296,7 @@ def _drop_background_colours(norm: np.ndarray, fg: np.ndarray, bg_px: np.ndarray
 
 
 def build_layer(image: np.ndarray, kps: np.ndarray,
-                mask: Optional[np.ndarray] = None) -> Optional[HairLayer]:
+                mask: Optional[np.ndarray] = None, with_ears: bool = True) -> Optional[HairLayer]:
     kps = np.asarray(kps, np.float32)
     if mask is None:
         mask = segment_hair(image, kps)
@@ -217,8 +314,21 @@ def build_layer(image: np.ndarray, kps: np.ndarray,
     # Feather proportionally to face size so the edge looks the same at any distance.
     f = max(3, int(eye_d * 0.08) | 1)
     alpha = cv2.GaussianBlur(alpha, (f, f), 0)
-    return HairLayer(_decontaminate(image[y1:y2, x1:x2], mask[y1:y2, x1:x2]), alpha,
-                     kps - np.array([x1, y1], np.float32))
+    layer = HairLayer(_decontaminate(image[y1:y2, x1:x2], mask[y1:y2, x1:x2]), alpha,
+                      kps - np.array([x1, y1], np.float32))
+    if with_ears:
+        try:
+            ear_mask = segment_ears(image, kps, mask)
+            if ear_mask.max() > 0:
+                layer.ears = build_layer(image, kps, ear_mask, with_ears=False)
+                norm = cv2.warpAffine(image, _normaliser(kps), (384, 384), borderMode=cv2.BORDER_REPLICATE)
+                skin = _cheek_skin(norm)
+                if skin is not None and layer.ears is not None:
+                    skin_bgr = cv2.cvtColor(np.uint8([[skin]]), cv2.COLOR_YCrCb2BGR)
+                    layer.skin_lab = cv2.cvtColor(skin_bgr, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+        except Exception as e:  # ears are optional
+            print(f"[DLC.HAIR] Ear extraction skipped: {e}")
+    return layer
 
 
 def _decontaminate(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -289,14 +399,37 @@ def get_layer(source_path: Optional[str], source_face: Any) -> Optional[HairLaye
         return layer
 
 
-def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps) -> np.ndarray:
-    """Composite ``layer`` onto ``frame`` aligned to ``target_kps`` (in place)."""
+def _ear_colour_shift(frame: np.ndarray, layer: HairLayer, tk: np.ndarray) -> Optional[np.ndarray]:
+    """Lab shift so the picture's ears match the (swapped) face's skin now."""
+    if layer.skin_lab is None:
+        return None
+    M = _normaliser(tk, 32.0)  # small, cheap view of the face
+    view = cv2.warpAffine(frame, M, (384, 384), borderMode=cv2.BORDER_REPLICATE)
+    # cheeks at half scale: eye centre (192,160), eye distance 32
+    lab = cv2.cvtColor(view, cv2.COLOR_BGR2LAB)
+    px = np.concatenate([lab[180:193, 166:179].reshape(-1, 3), lab[180:193, 205:218].reshape(-1, 3)])
+    shift = np.median(px.astype(np.float32), axis=0) - layer.skin_lab
+    if layer._shift is not None:
+        # smooth, and ignore sudden jumps (a hand passing over a cheek)
+        jump = np.abs(shift - layer._shift).max()
+        w = 0.15 if jump < 20 else 0.02
+        shift = (1 - w) * layer._shift + w * shift
+    layer._shift = shift
+    return shift
+
+
+def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps,
+               _recolour: Optional[np.ndarray] = None) -> np.ndarray:
+    """Composite ``layer`` (ears, then hair) onto ``frame`` aligned to ``target_kps``."""
     if layer is None or target_kps is None:
         return frame
     tk = np.asarray(target_kps, np.float32)
     if tk.shape != (5, 2) or not np.all(np.isfinite(tk)):
         return frame
-    A = _umeyama(layer.kps, tk)
+    if layer.ears is not None:
+        shift = _ear_colour_shift(frame, layer, tk)
+        apply_hair(frame, layer.ears, tk, _recolour=shift if shift is not None else np.zeros(3, np.float32))
+    A = _head_transform(layer.kps, tk)
     lh, lw = layer.alpha.shape[:2]
     corners = np.array([[0, 0], [lw, 0], [lw, lh], [0, lh]], np.float32)
     t = corners @ A[:, :2].T + A[:, 2]
@@ -326,6 +459,9 @@ def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps) -> np.
     alpha = cv2.warpAffine(src_a, A_roi, size, flags=cv2.INTER_LINEAR, borderValue=0)
     if alpha.max() == 0:
         return frame
+    if _recolour is not None and np.any(_recolour):
+        lab = cv2.cvtColor(hair, cv2.COLOR_BGR2LAB).astype(np.float32) + _recolour
+        hair = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
     roi = frame[y1:y2, x1:x2]
     a3 = cv2.merge([alpha, alpha, alpha])
     frame[y1:y2, x1:x2] = cv2.add(cv2.multiply(hair, a3, scale=1 / 255.0),
@@ -360,6 +496,17 @@ _CANON_KPS = (np.array([[38.29, 51.70], [73.53, 51.50], [56.02, 71.74],
 _ZONE_CACHE: dict = {}
 
 
+def _canonical_ear_zone() -> np.ndarray:
+    z = _ZONE_CACHE.get("ears")
+    if z is None:
+        z = np.zeros((384, 384), np.uint8)
+        cv2.rectangle(z, (192 - 135, 135), (192 - 72, 255), 255, -1)
+        cv2.rectangle(z, (192 + 72, 135), (192 + 135, 255), 255, -1)
+        z = cv2.GaussianBlur(z, (15, 15), 0)
+        _ZONE_CACHE["ears"] = z
+    return z
+
+
 def _canonical_hair_zone() -> np.ndarray:
     z = _ZONE_CACHE.get("zone")
     if z is not None:
@@ -367,7 +514,7 @@ def _canonical_hair_zone() -> np.ndarray:
     N = 384
     zone = np.zeros((N, N), np.uint8)
     cv2.ellipse(zone, (192, 140), (150, 150), 0, 180, 360, 255, -1)        # above/around crown
-    cv2.rectangle(zone, (192 - 150, 140), (192 + 150, 300), 255, -1)        # beside the face to the jaw
+    cv2.rectangle(zone, (192 - 150, 140), (192 + 150, 280), 255, -1)        # beside the face to the jaw
     # keep the face itself (forehead to chin, ears inward) out of the zone
     cv2.ellipse(zone, (192, 190), (70, 105), 0, 0, 360, 0, -1)  # ears/neck are kept by the skin test
     # neck/shoulders below the jaw are not touched
@@ -433,8 +580,13 @@ class BackgroundPlate:
         cv2.add(self.seen, 1, dst=self.seen, mask=free)
         self.bg8 = cv2.convertScaleAbs(self.bg)
 
-    def hide_hair(self, frame: np.ndarray, kps, threshold: int = 28) -> np.ndarray:
-        """Paint the learned background over non-face, non-skin pixels around the head."""
+    def hide_hair(self, frame: np.ndarray, kps, threshold: int = 28,
+                  hide_ears: bool = False) -> np.ndarray:
+        """Paint the learned background over non-face, non-skin pixels around the head.
+
+        With ``hide_ears`` your own ears (skin beside the face) are removed
+        too, so the picture's ears can be drawn in their place.
+        """
         if self.bg8 is None or kps is None:
             return frame
         k = np.asarray(kps, np.float32)
@@ -452,6 +604,10 @@ class BackgroundPlate:
         A_roi[0, 2] -= x1
         A_roi[1, 2] -= y1
         zone = cv2.warpAffine(zone_c, A_roi, (x2 - x1, y2 - y1), borderValue=0)
+        ear_zone = (cv2.warpAffine(_canonical_ear_zone(), A_roi, (x2 - x1, y2 - y1), borderValue=0)
+                    if hide_ears else None)
+        if ear_zone is not None:
+            zone = cv2.max(zone, ear_zone)
         roi = frame[y1:y2, x1:x2]
         bg = self.bg8[y1:y2, x1:x2]
         known = self.seen[y1:y2, x1:x2] >= self.min_seen
@@ -469,6 +625,8 @@ class BackgroundPlate:
             cr0, cb0 = np.median(samples[:, 1]), np.median(samples[:, 2])
             skin = (np.abs(ycc[..., 1].astype(np.int16) - cr0) < 10) & \
                    (np.abs(ycc[..., 2].astype(np.int16) - cb0) < 10)
+            if ear_zone is not None:
+                skin &= ear_zone < 128   # skin in the ear zones = your ears: hide them
             person &= ~skin
 
         kk = max(3, int(ed * 0.06) | 1)
