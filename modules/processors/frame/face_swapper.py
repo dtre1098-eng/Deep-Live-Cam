@@ -20,6 +20,7 @@ from modules.utilities import (
 from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
+from modules.processors.frame.skin_tone import match_skin_tone, reset_state as reset_skin_tone_state
 import os
 from collections import deque
 import time
@@ -498,7 +499,7 @@ def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, 
         mask_t = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
         fake_t = torch.from_numpy(bgr_fake_crop).float().cuda()
         tgt_t = torch.from_numpy(target_crop).float().cuda()
-        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
+        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).add_(0.5).clamp_(0, 255).to(torch.uint8).cpu().numpy()
         target_img[y1p:y2p, x1p:x2p] = blended
     else:
         # Fused uint8 blend via cv2 SIMD — no float32 round-trip.
@@ -585,6 +586,26 @@ def paste_swapped_face(temp_frame: Frame, bgr_fake: np.ndarray, M: np.ndarray, t
         # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
         _face_size = bgr_fake.shape[0]
         _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
+
+        # Match the swapped face's skin tone/lighting to the real face so it
+        # blends with the neck/body instead of looking pasted on.
+        if getattr(modules.globals, "skin_tone_match", True):
+            try:
+                if bgr_fake.dtype != np.uint8:
+                    bgr_fake = np.clip(bgr_fake, 0, 255).astype(np.uint8)
+                target_aligned = cv2.warpAffine(
+                    temp_frame, M, (bgr_fake.shape[1], bgr_fake.shape[0]),
+                    borderValue=0.0,
+                )
+                kps = getattr(target_face, "kps", None)
+                center = np.asarray(kps, np.float32).mean(axis=0) if kps is not None else None
+                scale = 1.0 / max(float(np.sqrt(abs(np.linalg.det(M[:, :2])))), 1e-6) * _face_size
+                bgr_fake = match_skin_tone(
+                    bgr_fake, target_aligned, center, scale,
+                    strength=float(getattr(modules.globals, "skin_tone_strength", 1.0)),
+                )
+            except Exception as e:
+                logging.debug(f"Skin tone match skipped: {e}")
 
         swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
 
@@ -856,8 +877,12 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
     sharpness_value = getattr(modules.globals, "sharpness", 0.0)
     enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
 
-    # Skip copy when no post-processing is active
-    if sharpness_value <= 0.0 and not enable_interpolation:
+    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
+    interpolation_active = enable_interpolation and 0 < interpolation_weight < 1
+
+    # Skip copy when no post-processing is active (interpolation is enabled
+    # by default with weight 0, which is a no-op -- don't copy the frame).
+    if sharpness_value <= 0.0 and not interpolation_active:
         PREVIOUS_FRAME_RESULT = None
         return current_frame
 
@@ -1222,6 +1247,7 @@ def process_frames(
 
 def process_image(source_path: str, target_path: str, output_path: str) -> None:
     """Processes a single target image."""
+    reset_skin_tone_state()
     # --- Reset interpolation state for single image processing ---
     global PREVIOUS_FRAME_RESULT
     PREVIOUS_FRAME_RESULT = None
@@ -1283,6 +1309,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """Sets up and calls the frame processing for video."""
+    reset_skin_tone_state()
     # --- Reset interpolation state before starting video processing ---
     global PREVIOUS_FRAME_RESULT
     PREVIOUS_FRAME_RESULT = None
