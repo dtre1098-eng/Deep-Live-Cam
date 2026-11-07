@@ -68,6 +68,7 @@ from modules.face_analyser import (
 )
 from modules.gettext import LanguageManager
 from modules.live_tracking import FaceTracker
+from modules.processors.frame.hair_transfer import BackgroundPlate, get_layer as get_hair_layer
 from modules.gpu_processing import gpu_cvt_color, gpu_flip, gpu_resize
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import (
@@ -330,6 +331,7 @@ def save_switch_states():
         "skin_tone_match": modules.globals.skin_tone_match,
         "face_stabilization": modules.globals.face_stabilization,
         "hair_transfer": modules.globals.hair_transfer,
+        "hide_real_hair": modules.globals.hide_real_hair,
         "nsfw_filter": modules.globals.nsfw_filter,
         "live_mirror": modules.globals.live_mirror,
         "live_resizable": modules.globals.live_resizable,
@@ -363,6 +365,7 @@ def load_switch_states():
         modules.globals.skin_tone_match = state.get("skin_tone_match", True)
         modules.globals.face_stabilization = state.get("face_stabilization", True)
         modules.globals.hair_transfer = state.get("hair_transfer", True)
+        modules.globals.hide_real_hair = state.get("hide_real_hair", True)
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
         modules.globals.live_mirror = state.get("live_mirror", False)
         modules.globals.live_resizable = state.get("live_resizable", True)
@@ -642,6 +645,9 @@ class MainWindow(QMainWindow):
         self.sw_hair = make("hair_transfer", "Use Source Hair",
                             "Show the hair from the source picture (follows your head as you move). "
                             "Put <picture>.hair.png next to the picture to use your own hair mask")
+        self.sw_hide_hair = make("hide_real_hair", "Hide My Hair",
+                                 "Live: hide your own hair so only the source picture's hair shows. "
+                                 "Step out of view for a second at the start so it can learn the background")
         self.sw_show_fps = make("show_fps", "Show FPS",
                                 "Display frames-per-second counter on the live preview")
 
@@ -657,7 +663,7 @@ class MainWindow(QMainWindow):
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
             self.sw_skin_tone, self.sw_stabilize,
-            self.sw_hair,
+            self.sw_hair, self.sw_hide_hair,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
@@ -1232,6 +1238,7 @@ class _ProcessingWorker(QThread):
         det_interval = max(1, round(self._fps * 0.08))
         tracker = FaceTracker(max_faces=1)
         tracker_many = None
+        bg_plate = BackgroundPlate()
 
         while not self._stop.is_set():
             try:
@@ -1328,6 +1335,26 @@ class _ProcessingWorker(QThread):
                 # detection cycle — the helper no-ops if already present).
                 if modules.globals.mouth_mask and cached_faces:
                     ensure_landmarks(temp_frame, cached_faces)
+
+                # Hide the real hair (before the swap, which then draws the
+                # source hair on top) so the hair matches the picture.
+                if (
+                    modules.globals.hair_transfer
+                    and modules.globals.hide_real_hair
+                    and source_image is not None
+                    and get_hair_layer(modules.globals.source_path, source_image) is not None
+                ):
+                    face_kps = [
+                        f.kps for f in (cached_faces or [])
+                        if getattr(f, "kps", None) is not None
+                    ]
+                    bg_plate.update(temp_frame, face_kps)
+                    if face_kps:
+                        temp_frame = temp_frame.copy()
+                        for k in face_kps:
+                            bg_plate.hide_hair(temp_frame, k)
+                else:
+                    bg_plate.reset()
 
                 for fp in frame_processors:
                     if fp.NAME == "DLC.FACE-ENHANCER":
