@@ -329,6 +329,7 @@ def save_switch_states():
         "color_correction": modules.globals.color_correction,
         "skin_tone_match": modules.globals.skin_tone_match,
         "face_stabilization": modules.globals.face_stabilization,
+        "hair_transfer": modules.globals.hair_transfer,
         "nsfw_filter": modules.globals.nsfw_filter,
         "live_mirror": modules.globals.live_mirror,
         "live_resizable": modules.globals.live_resizable,
@@ -361,6 +362,7 @@ def load_switch_states():
         modules.globals.color_correction = state.get("color_correction", False)
         modules.globals.skin_tone_match = state.get("skin_tone_match", True)
         modules.globals.face_stabilization = state.get("face_stabilization", True)
+        modules.globals.hair_transfer = state.get("hair_transfer", True)
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
         modules.globals.live_mirror = state.get("live_mirror", False)
         modules.globals.live_resizable = state.get("live_resizable", True)
@@ -637,6 +639,9 @@ class MainWindow(QMainWindow):
                                  "Match the swapped face's skin tone and lighting to your real face/body")
         self.sw_stabilize = make("face_stabilization", "Stabilize Face",
                                  "Live: track and smooth the face so the swap stays on while you move")
+        self.sw_hair = make("hair_transfer", "Use Source Hair",
+                            "Show the hair from the source picture (follows your head as you move). "
+                            "Put <picture>.hair.png next to the picture to use your own hair mask")
         self.sw_show_fps = make("show_fps", "Show FPS",
                                 "Display frames-per-second counter on the live preview")
 
@@ -652,6 +657,7 @@ class MainWindow(QMainWindow):
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
             self.sw_skin_tone, self.sw_stabilize,
+            self.sw_hair,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)

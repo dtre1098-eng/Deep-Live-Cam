@@ -1,0 +1,245 @@
+"""Hair transfer: show the source picture's hair on the swapped face.
+
+inswapper only replaces the inner face (roughly hairline to chin), so the
+hair in the output has always been the person in front of the camera's own
+hair. This module adds the source photo's hair on top:
+
+1. Once per source picture, the hair is cut out of the photo
+   (GrabCut seeded from the face position: the region around/above the face
+   is "probably hair", the face skin and far background are "not hair").
+   You can override the automatic cut-out by putting a mask next to the
+   photo: ``<photo name>.hair.png`` (white = hair, black = not hair).
+2. Every frame, the hair layer is placed with a similarity transform
+   (position, size, rotation) fitted from the source face's 5 keypoints to
+   the live face's keypoints. In live mode those keypoints come from the
+   smoothing tracker, so the hair follows you without jitter, scales as you
+   move closer/farther and is held through brief detection drop-outs.
+
+Limitations: it's a 2D layer, so it follows tilt but not turning the head
+far to the side; it cannot erase your real hair where the source hair does
+not reach; hands passing in front of the hair are drawn behind it.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+
+_LOCK = threading.Lock()
+_CACHE: dict = {"key": None, "layer": None}
+
+
+class HairLayer:
+    __slots__ = ("bgr", "alpha", "kps")
+
+    def __init__(self, bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray):
+        self.bgr = bgr      # HxWx3 uint8, cropped around the hair
+        self.alpha = alpha  # HxW uint8, feathered hair mask
+        self.kps = kps      # 5x2 float32 source keypoints in crop coords
+
+
+def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Least-squares similarity transform (2x3) mapping src -> dst."""
+    src = src.astype(np.float64)
+    dst = dst.astype(np.float64)
+    mu_s, mu_d = src.mean(0), dst.mean(0)
+    s_c, d_c = src - mu_s, dst - mu_d
+    cov = d_c.T @ s_c / len(src)
+    U, S, Vt = np.linalg.svd(cov)
+    D = np.eye(2)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        D[1, 1] = -1
+    R = U @ D @ Vt
+    var_s = (s_c ** 2).sum() / len(src)
+    scale = (S * np.diag(D)).sum() / max(var_s, 1e-9)
+    t = mu_d - scale * R @ mu_s
+    return np.hstack([scale * R, t[:, None]]).astype(np.float32)
+
+
+def segment_hair(image: np.ndarray, kps: np.ndarray) -> np.ndarray:
+    """Return a uint8 hair mask (0/255) for the face with keypoints ``kps``.
+
+    Works in an upright, face-normalised frame so tilted photos work too.
+    """
+    kps = np.asarray(kps, np.float32)
+    eye_c = (kps[0] + kps[1]) / 2
+    mouth_c = (kps[3] + kps[4]) / 2
+    eye_d = float(np.linalg.norm(kps[1] - kps[0]))
+    if eye_d < 4:
+        return np.zeros(image.shape[:2], np.uint8)
+
+    # Normalise: eyes horizontal, eye distance = 64px, eye centre at (192, 160).
+    S = 64.0 / eye_d
+    angle = np.degrees(np.arctan2(kps[1][1] - kps[0][1], kps[1][0] - kps[0][0]))
+    M = cv2.getRotationMatrix2D((float(eye_c[0]), float(eye_c[1])), angle, S)
+    M[:, 2] += np.array([192.0, 160.0]) - eye_c
+    N = 384
+    norm = cv2.warpAffine(image, M, (N, N), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+    inside = cv2.warpAffine(np.full(image.shape[:2], 255, np.uint8), M, (N, N),
+                            flags=cv2.INTER_NEAREST, borderValue=0) > 0
+    mouth_y = 160 + float(np.linalg.norm(mouth_c - eye_c)) * S  # ~ 160 + 70
+
+    # Seeds in normalised space (eye distance 64).
+    gc = np.full((N, N), cv2.GC_BGD, np.uint8)
+    cv2.ellipse(gc, (192, 150), (150, 175), 0, 0, 360, cv2.GC_PR_BGD, -1)
+    cv2.ellipse(gc, (192, 125), (118, 120), 0, 180, 360, cv2.GC_PR_FGD, -1)   # crown
+    cv2.rectangle(gc, (192 - 118, 125), (192 - 68, int(mouth_y) + 40), cv2.GC_PR_FGD, -1)  # sides
+    cv2.rectangle(gc, (192 + 68, 125), (192 + 118, int(mouth_y) + 40), cv2.GC_PR_FGD, -1)
+    cv2.ellipse(gc, (192, 72), (55, 22), 0, 0, 360, cv2.GC_FGD, -1)  # top of head
+    # Face skin is definitely not hair (also teaches GrabCut the skin colour).
+    cv2.ellipse(gc, (192, int((160 + mouth_y) / 2)), (58, int(mouth_y - 160) + 30),
+                0, 0, 360, cv2.GC_BGD, -1)
+    # Neck/shoulders straight below the chin: probably not hair.
+    cv2.rectangle(gc, (192 - 50, int(mouth_y) + 20), (192 + 50, N), cv2.GC_PR_BGD, -1)
+    gc[~inside] = cv2.GC_BGD
+
+    try:
+        bgd = np.zeros((1, 65), np.float64)
+        fgd = np.zeros((1, 65), np.float64)
+        cv2.grabCut(norm, gc, None, bgd, fgd, 5, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return np.zeros(image.shape[:2], np.uint8)
+    fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+
+    # Clean up: close small gaps, drop specks, keep the blob(s) touching the head.
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(fg)
+    head = np.zeros_like(fg)
+    cv2.ellipse(head, (192, 125), (125, 125), 0, 0, 360, 255, -1)
+    keep = np.zeros_like(fg)
+    for i in range(1, n):
+        comp = lab == i
+        if stats[i, cv2.CC_STAT_AREA] > 150 and (head[comp] > 0).any():
+            keep[comp] = 255
+
+    Minv = cv2.invertAffineTransform(M)
+    return cv2.warpAffine(keep, Minv, (image.shape[1], image.shape[0]),
+                          flags=cv2.INTER_LINEAR, borderValue=0)
+
+
+def build_layer(image: np.ndarray, kps: np.ndarray,
+                mask: Optional[np.ndarray] = None) -> Optional[HairLayer]:
+    kps = np.asarray(kps, np.float32)
+    if mask is None:
+        mask = segment_hair(image, kps)
+    if mask is None or mask.max() == 0:
+        return None
+    ys, xs = np.nonzero(mask > 127)
+    if len(xs) < 50:
+        return None
+    eye_d = float(np.linalg.norm(kps[1] - kps[0]))
+    pad = int(eye_d * 0.2) + 2
+    h, w = mask.shape[:2]
+    x1, y1 = max(0, xs.min() - pad), max(0, ys.min() - pad)
+    x2, y2 = min(w, xs.max() + pad + 1), min(h, ys.max() + pad + 1)
+    alpha = mask[y1:y2, x1:x2].copy()
+    # Feather proportionally to face size so the edge looks the same at any distance.
+    f = max(3, int(eye_d * 0.08) | 1)
+    alpha = cv2.GaussianBlur(alpha, (f, f), 0)
+    return HairLayer(_decontaminate(image[y1:y2, x1:x2], mask[y1:y2, x1:x2]), alpha,
+                     kps - np.array([x1, y1], np.float32))
+
+
+def _decontaminate(bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Replace non-hair pixels with the nearest hair pixel's colour.
+
+    The feathered alpha edge would otherwise blend in the source photo's
+    background, leaving a light/dark halo around the hair.
+    """
+    hair = mask > 127
+    if hair.all() or not hair.any():
+        return bgr.copy()
+    # Shrink a little so the colours come from solidly-hair pixels.
+    core = cv2.erode(hair.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    if not core.any():
+        core = hair
+    _, labels = cv2.distanceTransformWithLabels(
+        (~core).astype(np.uint8), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(core)
+    lut = np.zeros((labels.max() + 1, 3), np.uint8)
+    lut[labels[ys, xs]] = bgr[ys, xs]
+    out = lut[labels]
+    out[core] = bgr[core]
+    return out
+
+
+def _load_mask_override(path: str, shape) -> Optional[np.ndarray]:
+    base, _ = os.path.splitext(path)
+    for cand in (base + ".hair.png", path + ".hair.png"):
+        if os.path.exists(cand):
+            m = cv2.imdecode(np.fromfile(cand, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if m is not None:
+                if m.shape[:2] != shape[:2]:
+                    m = cv2.resize(m, (shape[1], shape[0]))
+                return m
+    return None
+
+
+def get_layer(source_path: Optional[str], source_face: Any) -> Optional[HairLayer]:
+    """Hair layer for the current source picture (built once, cached)."""
+    kps = getattr(source_face, "kps", None)
+    if not source_path or kps is None or not os.path.exists(source_path):
+        return None
+    try:
+        mtime = os.path.getmtime(source_path)
+    except OSError:
+        return None
+    key = (source_path, mtime, np.round(np.asarray(kps, np.float32), 1).tobytes())
+    with _LOCK:
+        if _CACHE["key"] == key:
+            return _CACHE["layer"]
+        layer = None
+        try:
+            img = cv2.imdecode(np.fromfile(source_path, np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                layer = build_layer(img, kps, _load_mask_override(source_path, img.shape))
+        except Exception as e:  # never break the swap
+            print(f"[DLC.HAIR] Could not extract hair from source picture: {e}")
+        _CACHE["key"], _CACHE["layer"] = key, layer
+        if layer is None:
+            print("[DLC.HAIR] No hair found in the source picture; hair transfer skipped.")
+        return layer
+
+
+def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps) -> np.ndarray:
+    """Composite ``layer`` onto ``frame`` aligned to ``target_kps`` (in place)."""
+    if layer is None or target_kps is None:
+        return frame
+    tk = np.asarray(target_kps, np.float32)
+    if tk.shape != (5, 2) or not np.all(np.isfinite(tk)):
+        return frame
+    A = _umeyama(layer.kps, tk)
+    lh, lw = layer.alpha.shape[:2]
+    corners = np.array([[0, 0], [lw, 0], [lw, lh], [0, lh]], np.float32)
+    t = corners @ A[:, :2].T + A[:, 2]
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, int(np.floor(t[:, 0].min()))), max(0, int(np.floor(t[:, 1].min())))
+    x2, y2 = min(fw, int(np.ceil(t[:, 0].max())) + 1), min(fh, int(np.ceil(t[:, 1].max())) + 1)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return frame
+    A_roi = A.copy()
+    A_roi[0, 2] -= x1
+    A_roi[1, 2] -= y1
+    size = (x2 - x1, y2 - y1)
+    hair = cv2.warpAffine(layer.bgr, A_roi, size, flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+    alpha = cv2.warpAffine(layer.alpha, A_roi, size, flags=cv2.INTER_LINEAR, borderValue=0)
+    if alpha.max() == 0:
+        return frame
+    roi = frame[y1:y2, x1:x2]
+    a3 = cv2.merge([alpha, alpha, alpha])
+    frame[y1:y2, x1:x2] = cv2.add(cv2.multiply(hair, a3, scale=1 / 255.0),
+                                  cv2.multiply(roi, 255 - a3, scale=1 / 255.0))
+    return frame
+
+
+def reset_cache() -> None:
+    with _LOCK:
+        _CACHE["key"], _CACHE["layer"] = None, None
