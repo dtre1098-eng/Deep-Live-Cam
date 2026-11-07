@@ -250,3 +250,151 @@ def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps) -> np.
 def reset_cache() -> None:
     with _LOCK:
         _CACHE["key"], _CACHE["layer"] = None, None
+
+
+# ---------------------------------------------------------------------------
+# Hiding the live person's own hair
+# ---------------------------------------------------------------------------
+# The source hair is pasted on top, but wherever your real hair reaches
+# beyond it (longer, bigger, different parting) it still shows, so the hair
+# never looks identical to the picture. For a webcam the background is
+# static, so we learn it from pixels away from the person and, around the
+# head (not on the face), paint the learned background over anything that
+# differs from it -- i.e. your real hair. The source hair then goes on top.
+#
+# Background behind your head is learned as you move around; for a clean
+# result step out of the frame (or lean far to the side) for a second when
+# you start. Where the background has never been seen nothing is changed.
+
+# Canonical keypoints (arcface template) and the zone, in a 384x384
+# face-normalised space: eye centre (192,160), eye distance 64.
+_CANON_KPS = (np.array([[38.29, 51.70], [73.53, 51.50], [56.02, 71.74],
+                        [41.55, 92.37], [70.73, 92.20]], np.float32)
+              - np.array([55.91, 51.60], np.float32)) * (64.0 / 35.24) + np.array([192.0, 160.0], np.float32)
+_ZONE_CACHE: dict = {}
+
+
+def _canonical_hair_zone() -> np.ndarray:
+    z = _ZONE_CACHE.get("zone")
+    if z is not None:
+        return z
+    N = 384
+    zone = np.zeros((N, N), np.uint8)
+    cv2.ellipse(zone, (192, 140), (150, 150), 0, 180, 360, 255, -1)        # above/around crown
+    cv2.rectangle(zone, (192 - 150, 140), (192 + 150, 300), 255, -1)        # beside the face to the jaw
+    # keep the face itself (forehead to chin, ears inward) out of the zone
+    cv2.ellipse(zone, (192, 190), (70, 105), 0, 0, 360, 0, -1)  # ears/neck are kept by the skin test
+    # neck/shoulders below the jaw are not touched
+    cv2.rectangle(zone, (192 - 40, 250), (192 + 40, N), 0, -1)
+    zone = cv2.GaussianBlur(zone, (21, 21), 0)
+    _ZONE_CACHE["zone"] = zone
+    return zone
+
+
+class BackgroundPlate:
+    """Running model of the static camera background (kept cheap: cv2 ops)."""
+
+    def __init__(self, rate: float = 0.05, min_seen: int = 4, every: int = 2):
+        self.rate = rate
+        self.min_seen = min_seen
+        self.every = every
+        self.bg: Optional[np.ndarray] = None     # float32 HxWx3
+        self.bg8: Optional[np.ndarray] = None    # uint8 copy used for painting
+        self.seen: Optional[np.ndarray] = None   # uint8 HxW, saturating count
+        self._n = 0
+
+    def reset(self) -> None:
+        self.bg = self.bg8 = self.seen = None
+        self._n = 0
+
+    @staticmethod
+    def _free_mask(shape, faces_kps) -> np.ndarray:
+        """255 where it's safe to learn background (away from any person)."""
+        h, w = shape[:2]
+        m = np.full((h, w), 255, np.uint8)
+        for k in faces_kps:
+            k = np.asarray(k, np.float32)
+            ed = float(np.linalg.norm(k[1] - k[0]))
+            c = k.mean(axis=0)
+            cv2.circle(m, (int(c[0]), int(c[1] - ed * 0.4)), int(ed * 3.6), 0, -1)
+            cv2.rectangle(m, (int(c[0] - ed * 5), int(c[1])), (int(c[0] + ed * 5), h), 0, -1)
+        return m
+
+    def update(self, frame: np.ndarray, faces_kps) -> None:
+        h, w = frame.shape[:2]
+        if self.bg is None or self.bg.shape[:2] != (h, w):
+            self.bg = frame.astype(np.float32)
+            self.bg8 = frame.copy()
+            self.seen = np.zeros((h, w), np.uint8)
+            self._n = 0
+        self._n += 1
+        if self._n % self.every:
+            return
+        free = self._free_mask(frame.shape, faces_kps or [])
+        # Camera moved / scene changed: compare on a small copy, every ~0.5s.
+        if self._n % 16 == 0:
+            sm = (w // 8, h // 8)
+            fs, bs = cv2.resize(frame, sm), cv2.resize(self.bg8, sm)
+            known = (cv2.resize(free, sm, interpolation=cv2.INTER_NEAREST) > 0) & \
+                    (cv2.resize(self.seen, sm, interpolation=cv2.INTER_NEAREST) >= self.min_seen)
+            if known.sum() > 200 and (cv2.absdiff(fs, bs).max(axis=2)[known] > 45).mean() > 0.5:
+                self.bg[:] = frame
+                self.seen[:] = 0
+        # Pixels never seen before: take the frame value directly.
+        newly = cv2.bitwise_and(free, cv2.compare(self.seen, 0, cv2.CMP_EQ))
+        cv2.copyTo(frame.astype(np.float32), newly, self.bg)
+        cv2.accumulateWeighted(frame, self.bg, self.rate, mask=free)
+        cv2.add(self.seen, 1, dst=self.seen, mask=free)
+        self.bg8 = cv2.convertScaleAbs(self.bg)
+
+    def hide_hair(self, frame: np.ndarray, kps, threshold: int = 28) -> np.ndarray:
+        """Paint the learned background over non-face, non-skin pixels around the head."""
+        if self.bg8 is None or kps is None:
+            return frame
+        k = np.asarray(kps, np.float32)
+        if k.shape != (5, 2) or not np.all(np.isfinite(k)):
+            return frame
+        A = _umeyama(_CANON_KPS, k)
+        zone_c = _canonical_hair_zone()
+        corners = np.array([[0, 0], [384, 0], [384, 384], [0, 384]], np.float32) @ A[:, :2].T + A[:, 2]
+        fh, fw = frame.shape[:2]
+        x1, y1 = max(0, int(corners[:, 0].min())), max(0, int(corners[:, 1].min()))
+        x2, y2 = min(fw, int(corners[:, 0].max()) + 1), min(fh, int(corners[:, 1].max()) + 1)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return frame
+        A_roi = A.copy()
+        A_roi[0, 2] -= x1
+        A_roi[1, 2] -= y1
+        zone = cv2.warpAffine(zone_c, A_roi, (x2 - x1, y2 - y1), borderValue=0)
+        roi = frame[y1:y2, x1:x2]
+        bg = self.bg8[y1:y2, x1:x2]
+        known = self.seen[y1:y2, x1:x2] >= self.min_seen
+        person = (cv2.absdiff(roi, bg).max(axis=2) > threshold) & known
+
+        # Keep skin (ears, neck, hands): chroma close to this face's cheeks.
+        ycc = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+        cheeks = np.array([[192 - 40, 215], [192 + 40, 215], [192, 190]], np.float32) @ A_roi[:, :2].T + A_roi[:, 2]
+        ed = float(np.linalg.norm(k[1] - k[0]))
+        r = max(2, int(ed * 0.12))
+        samples = [ycc[max(0, int(cy) - r):int(cy) + r, max(0, int(cx) - r):int(cx) + r].reshape(-1, 3)
+                   for cx, cy in cheeks]
+        samples = np.concatenate([p for p in samples if p.size] or [np.zeros((0, 3), np.uint8)])
+        if len(samples) >= 10:
+            cr0, cb0 = np.median(samples[:, 1]), np.median(samples[:, 2])
+            skin = (np.abs(ycc[..., 1].astype(np.int16) - cr0) < 10) & \
+                   (np.abs(ycc[..., 2].astype(np.int16) - cb0) < 10)
+            person &= ~skin
+
+        kk = max(3, int(ed * 0.06) | 1)
+        person = person.astype(np.uint8) * 255
+        person = cv2.morphologyEx(person, cv2.MORPH_CLOSE, np.ones((kk, kk), np.uint8))
+        person = cv2.dilate(person, np.ones((kk, kk), np.uint8))   # catch fine strands at the edge
+        person = cv2.GaussianBlur(person, (kk * 2 + 1, kk * 2 + 1), 0)
+        person[~known] = 0
+        a = cv2.multiply(person, zone, scale=1 / 255.0)
+        if a.max() == 0:
+            return frame
+        a3 = cv2.merge([a, a, a])
+        frame[y1:y2, x1:x2] = cv2.add(cv2.multiply(bg, a3, scale=1 / 255.0),
+                                      cv2.multiply(roi, 255 - a3, scale=1 / 255.0))
+        return frame

@@ -35,6 +35,7 @@ color_correction: bool = False   # Enable color correction (implementation speci
 skin_tone_match: bool = True     # Match swapped face skin tone/lighting to the real face/body
 skin_tone_strength: float = 1.0  # 0..1 amount of skin tone correction
 hair_transfer: bool = True      # Overlay the source picture's hair on the swapped face
+hide_real_hair: bool = True     # Live: paint learned background over your own hair so only the source hair shows
 face_stabilization: bool = True  # Live: smooth/track the face so the swap stays locked on while moving
 nsfw_filter: bool = False
 

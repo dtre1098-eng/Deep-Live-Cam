@@ -74,5 +74,46 @@ class HairTransferTests(unittest.TestCase):
         np.testing.assert_array_equal(out, frame)
 
 
+class HideRealHairTests(unittest.TestCase):
+    def _scene(self):
+        rng = np.random.default_rng(5)
+        bg = cv2.GaussianBlur(rng.integers(60, 200, (560, 640, 3)).astype(np.uint8), (0, 0), 5)
+        img, kps, hair = portrait(bg=(0, 0, 0))
+        person = img.max(axis=2) > 0
+        frame = bg.copy()
+        frame[person] = img[person]
+        return bg, frame, kps, hair
+
+    def test_hides_real_hair_keeps_face(self):
+        bg, frame, kps, hair = self._scene()
+        plate = ht.BackgroundPlate()
+        for _ in range(12):            # step out of view: learn the background
+            plate.update(bg.copy(), [])
+        plate.update(frame, [kps])
+        out = plate.hide_hair(frame.copy(), kps)
+        restored = cv2.absdiff(out, bg).max(axis=2) < 30
+        self.assertGreater(restored[hair].mean(), 0.6)
+        face = np.zeros(hair.shape, np.uint8)
+        cv2.ellipse(face, (320, 281), (60, 80), 0, 0, 360, 255, -1)
+        # face pixels unchanged (allowing 1-level rounding at the very edge)
+        self.assertLessEqual(int(cv2.absdiff(out, frame).max(axis=2)[face > 0].max()), 2)
+
+    def test_unknown_background_changes_nothing(self):
+        _, frame, kps, _ = self._scene()
+        plate = ht.BackgroundPlate()
+        plate.update(frame, [kps])
+        np.testing.assert_array_equal(plate.hide_hair(frame.copy(), kps), frame)
+
+    def test_camera_move_resets_background(self):
+        bg, _, _, _ = self._scene()
+        plate = ht.BackgroundPlate()
+        for _ in range(16):
+            plate.update(bg, [])
+        moved = np.roll(bg, 120, axis=1)
+        for _ in range(16):
+            plate.update(moved, [])
+        self.assertLess(cv2.absdiff(plate.bg8, moved).mean(), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

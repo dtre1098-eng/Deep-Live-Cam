@@ -138,7 +138,7 @@ class _Track:
 class FaceTracker:
     """Keeps swaps glued to faces between/through detections."""
 
-    def __init__(self, max_faces: int = 1, hold_seconds: float = 0.4,
+    def __init__(self, max_faces: int = 1, hold_seconds: float = 0.8,
                  min_cutoff: float = 1.5, beta: float = 20.0):
         self.max_faces = max_faces
         self.hold_seconds = hold_seconds
