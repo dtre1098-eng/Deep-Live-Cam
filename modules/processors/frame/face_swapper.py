@@ -19,6 +19,7 @@ from modules.cluster_analysis import find_closest_centroid
 from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 from modules.platform_info import OPENVINO_PROVIDER_CONFIG
 from modules.processors.frame.skin_tone import match_skin_tone, reset_state as reset_skin_tone_state
+from modules.processors.frame import hair_transfer
 import os
 from collections import deque
 import time
@@ -629,6 +630,20 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         swapped_frame = _apply_poisson_blend(
             swapped_frame, original_frame, target_face, M, bgr_fake
         )
+
+    # --- Source hair ---
+    # Overlay the source picture's hair, aligned to the (tracked) target
+    # keypoints so it follows the head and scales with distance. Only in
+    # simple mode, where every source face comes from source_path.
+    if (getattr(modules.globals, "hair_transfer", False)
+            and not getattr(modules.globals, "map_faces", False)):
+        try:
+            layer = hair_transfer.get_layer(modules.globals.source_path, source_face)
+            swapped_frame = hair_transfer.apply_hair(
+                swapped_frame, layer, getattr(target_face, "kps", None)
+            )
+        except Exception as e:
+            logging.debug(f"Hair transfer skipped: {e}")
 
     # Apply opacity blend between the original frame and the swapped frame
     if opacity >= 1.0:
