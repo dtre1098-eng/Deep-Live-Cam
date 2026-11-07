@@ -41,6 +41,23 @@ class HairTransferTests(unittest.TestCase):
         img, kps, gt = portrait()
         self.assertGreater(iou(ht.segment_hair(img, kps) > 127, gt), 0.9)
 
+    def test_no_picture_background_in_hair_on_busy_background(self):
+        for seed in range(4):
+            rng = np.random.default_rng(seed)
+            bg = np.zeros((560, 640, 3), np.uint8)
+            for _ in range(40):
+                x, y = rng.integers(0, 640), rng.integers(0, 560)
+                c = tuple(int(v) for v in rng.integers(40, 230, 3))
+                cv2.rectangle(bg, (x, y), (x + rng.integers(30, 160), y + rng.integers(30, 160)), c, -1)
+            img, kps, gt = portrait(bg=(0, 0, 0))
+            person = img.max(axis=2) > 0
+            scene = bg.copy()
+            scene[person] = img[person]
+            m = ht.segment_hair(scene, kps) > 127
+            leak = (m & ~gt).sum() / max(m.sum(), 1)
+            self.assertLess(leak, 0.03, f"picture {seed}: {leak:.1%} background in hair")
+            self.assertGreater((m & gt).sum() / gt.sum(), 0.9)
+
     def test_umeyama_recovers_similarity(self):
         src = np.random.default_rng(1).random((5, 2)).astype(np.float32) * 100
         a = np.radians(20)
