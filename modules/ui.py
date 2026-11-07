@@ -1351,8 +1351,10 @@ class _ProcessingWorker(QThread):
                     bg_plate.update(temp_frame, face_kps)
                     if face_kps:
                         temp_frame = temp_frame.copy()
+                        src_layer = get_hair_layer(modules.globals.source_path, source_image)
+                        hide_ears = src_layer is not None and src_layer.ears is not None
                         for k in face_kps:
-                            bg_plate.hide_hair(temp_frame, k)
+                            bg_plate.hide_hair(temp_frame, k, hide_ears=hide_ears)
                 else:
                     bg_plate.reset()
 
