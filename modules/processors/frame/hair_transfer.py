@@ -34,12 +34,23 @@ _CACHE: dict = {"key": None, "layer": None}
 
 
 class HairLayer:
-    __slots__ = ("bgr", "alpha", "kps")
+    __slots__ = ("bgr", "alpha", "kps", "levels")
 
     def __init__(self, bgr: np.ndarray, alpha: np.ndarray, kps: np.ndarray):
         self.bgr = bgr      # HxWx3 uint8, cropped around the hair
         self.alpha = alpha  # HxW uint8, feathered hair mask
         self.kps = kps      # 5x2 float32 source keypoints in crop coords
+        self.levels = {}    # n -> (bgr, alpha) shrunk by 2**-n (cached)
+
+    def level(self, n: int):
+        if n <= 0:
+            return self.bgr, self.alpha
+        if n not in self.levels:
+            f = 0.5 ** n
+            size = (max(1, int(round(self.bgr.shape[1] * f))), max(1, int(round(self.bgr.shape[0] * f))))
+            self.levels[n] = (cv2.resize(self.bgr, size, interpolation=cv2.INTER_AREA),
+                              cv2.resize(self.alpha, size, interpolation=cv2.INTER_AREA))
+        return self.levels[n]
 
 
 def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
@@ -298,9 +309,21 @@ def apply_hair(frame: np.ndarray, layer: Optional[HairLayer], target_kps) -> np.
     A_roi[0, 2] -= x1
     A_roi[1, 2] -= y1
     size = (x2 - x1, y2 - y1)
-    hair = cv2.warpAffine(layer.bgr, A_roi, size, flags=cv2.INTER_LINEAR,
-                          borderMode=cv2.BORDER_REPLICATE)
-    alpha = cv2.warpAffine(layer.alpha, A_roi, size, flags=cv2.INTER_LINEAR, borderValue=0)
+    # Shrinking a high-res picture a lot: use a cached, properly
+    # down-sampled copy so fine strands don't shimmer (alias) as you move;
+    # enlarging: bicubic to keep strands sharp.
+    scale = float(np.sqrt(abs(np.linalg.det(A[:, :2]))))
+    n = int(np.floor(np.log2(0.6 / scale))) + 1 if scale < 0.6 else 0
+    src_bgr, src_a = layer.level(n)
+    if n:
+        f_x = src_bgr.shape[1] / layer.bgr.shape[1]
+        f_y = src_bgr.shape[0] / layer.bgr.shape[0]
+        A_roi = A_roi.copy()
+        A_roi[:, 0] /= f_x
+        A_roi[:, 1] /= f_y
+    interp = cv2.INTER_CUBIC if scale > 1.05 else cv2.INTER_LINEAR
+    hair = cv2.warpAffine(src_bgr, A_roi, size, flags=interp, borderMode=cv2.BORDER_REPLICATE)
+    alpha = cv2.warpAffine(src_a, A_roi, size, flags=cv2.INTER_LINEAR, borderValue=0)
     if alpha.max() == 0:
         return frame
     roi = frame[y1:y2, x1:x2]

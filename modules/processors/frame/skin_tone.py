@@ -21,15 +21,15 @@ the current lighting. It works in LAB:
 from __future__ import annotations
 
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import cv2
 import numpy as np
 
 _MASK_CACHE: Dict[int, np.ndarray] = {}
 _STATE_LOCK = threading.Lock()
-# key -> (center_xy, face_scale, mean_shift(3,), std_ratio(3,))
-_STATE: Dict[int, Tuple[np.ndarray, float, np.ndarray, np.ndarray]] = {}
+# key -> {center, scale, shift, ratio, t_mean, t_std}
+_STATE: Dict[int, dict] = {}
 _next_key = 0
 
 
@@ -65,9 +65,9 @@ def _stats(lab: np.ndarray, sel: np.ndarray, valid: Optional[np.ndarray] = None)
 def _lookup_state(center: np.ndarray, scale: float):
     """Find the smoothing state of the same face from previous frames."""
     best_key, best_d = None, None
-    for k, (c, sc, _, _) in _STATE.items():
-        d = float(np.linalg.norm(c - center))
-        if d < max(sc, scale) * 0.6 and (best_d is None or d < best_d):
+    for k, st in _STATE.items():
+        d = float(np.linalg.norm(st["center"] - center))
+        if d < max(st["scale"], scale) * 0.6 and (best_d is None or d < best_d):
             best_key, best_d = k, d
     return best_key
 
@@ -80,16 +80,23 @@ def reset_state() -> None:
 def match_skin_tone(bgr_fake: np.ndarray, target_aligned: np.ndarray,
                     face_center: Optional[np.ndarray] = None,
                     face_scale: float = 0.0, strength: float = 1.0,
-                    smoothing: float = 0.7) -> np.ndarray:
+                    smoothing: float = 0.8) -> np.ndarray:
     """Return ``bgr_fake`` recoloured to match ``target_aligned``'s skin.
 
     Args:
         bgr_fake: swapped face, aligned (HxWx3 uint8).
         target_aligned: the real frame warped with the same affine (HxWx3).
         face_center / face_scale: face position/size in the frame, used to
-            keep per-face temporal smoothing state (None disables smoothing).
+            keep per-face temporal state (None disables smoothing and
+            occlusion handling).
         strength: 0..1 how much of the correction to apply.
         smoothing: 0..1 EMA weight of the previous frame's correction.
+
+    Hands and other things in front of the face: once a face has a skin
+    model, target pixels that don't fit it (a hand, a phone, a shadow) are
+    ignored, and if most of the cheeks/forehead are covered the previous
+    correction is kept unchanged, so the face colour doesn't jump when you
+    lift your hand.
     """
     global _next_key
     if bgr_fake is None or target_aligned is None or strength <= 0:
@@ -101,37 +108,80 @@ def match_skin_tone(bgr_fake: np.ndarray, target_aligned: np.ndarray,
 
     src_lab = cv2.cvtColor(bgr_fake, cv2.COLOR_BGR2LAB).astype(np.float32)
     tgt_lab = cv2.cvtColor(target_aligned, cv2.COLOR_BGR2LAB).astype(np.float32)
+    s = _stats(src_lab, sel)
+    if s is None:
+        return bgr_fake
+    s_mean, s_std = s
 
     # Ignore target pixels that fell outside the camera frame (black border
     # from warpAffine) or are blown-out/very dark.
-    valid = (tgt_lab[..., 0] > 15) & (tgt_lab[..., 0] < 250)
-    s = _stats(src_lab, sel)
-    t = _stats(tgt_lab, sel, valid)
-    if s is None or t is None:
-        return bgr_fake
-    s_mean, s_std = s
-    t_mean, t_std = t
+    valid = sel & (tgt_lab[..., 0] > 15) & (tgt_lab[..., 0] < 250)
+    n_sample = int(sel.sum())
 
-    ratio = np.clip(t_std / np.maximum(s_std, 1.0), 0.75, 1.33)
-    # Keep most of the source's contrast (identity detail); adapt fully on
-    # colour (a/b) means and lightness mean.
-    ratio = 1.0 + (ratio - 1.0) * 0.5
-    shift = t_mean - s_mean
-
-    if face_center is not None and smoothing > 0:
-        center = np.asarray(face_center, np.float32)
+    use_state = face_center is not None and smoothing > 0
+    center = np.asarray(face_center, np.float32) if face_center is not None else None
+    prev = None
+    key = None
+    if use_state:
         with _STATE_LOCK:
             key = _lookup_state(center, face_scale)
-            if key is not None:
-                _, _, p_shift, p_ratio = _STATE[key]
-                shift = smoothing * p_shift + (1 - smoothing) * shift
-                ratio = smoothing * p_ratio + (1 - smoothing) * ratio
-            else:
+            prev = dict(_STATE[key]) if key is not None else None
+
+    occluded = False
+    occ_count = prev.get("occ_count", 0) if prev is not None else 0
+    if occ_count > 45:
+        # "Covered" for ~1.5 s: more likely the lighting changed than a
+        # hand still in front of the face -- re-learn the skin model.
+        prev = dict(prev, t_mean=None)
+        occ_count = 0
+    if prev is not None and prev.get("t_mean") is not None:
+        # Keep only pixels that look like this person's skin as seen
+        # recently; a hand/object in front of the face is rejected.
+        dev = np.abs(tgt_lab - prev["t_mean"]) / np.maximum(prev["t_std"], 4.0)
+        fits = (dev[..., 0] < 3.0) & (dev[..., 1] < 3.0) & (dev[..., 2] < 3.0)
+        valid &= fits
+        occluded = valid.sum() < 0.5 * n_sample
+
+    if occluded:
+        occ_count += 1
+        shift, ratio = prev["shift"], prev["ratio"]
+        t_mean, t_std = prev["t_mean"], prev["t_std"]
+    else:
+        px = tgt_lab[valid]
+        if px.shape[0] < 50:
+            if prev is None:
+                return bgr_fake
+            shift, ratio = prev["shift"], prev["ratio"]
+            t_mean, t_std = prev["t_mean"], prev["t_std"]
+            occ_count += 1
+        else:
+            occ_count = 0
+            t_mean = np.median(px, axis=0)
+            t_std = px.std(axis=0)
+            # Contrast is adapted on lightness only (half-way, clamped); the
+            # colour channels keep the picture's own variation, so lips,
+            # makeup, freckles and blush stay as in the picture.
+            r_l = float(np.clip(t_std[0] / max(s_std[0], 1.0), 0.75, 1.33))
+            ratio = np.array([1.0 + (r_l - 1.0) * 0.5, 1.0, 1.0], np.float32)
+            shift = (t_mean - s_mean).astype(np.float32)
+            if prev is not None:
+                shift = smoothing * prev["shift"] + (1 - smoothing) * shift
+                ratio = smoothing * prev["ratio"] + (1 - smoothing) * ratio
+                if prev.get("t_mean") is not None:
+                    t_mean = 0.9 * prev["t_mean"] + 0.1 * t_mean
+                    t_std = 0.9 * prev["t_std"] + 0.1 * t_std
+
+    if use_state:
+        with _STATE_LOCK:
+            if key is None:
                 key = _next_key
                 _next_key += 1
                 if len(_STATE) > 16:
                     _STATE.clear()
-            _STATE[key] = (center, float(face_scale), shift, ratio)
+            _STATE[key] = {"center": center, "scale": float(face_scale),
+                           "shift": shift, "ratio": ratio,
+                           "t_mean": t_mean, "t_std": t_std,
+                           "occ_count": occ_count}
 
     out = (src_lab - s_mean) * ratio + s_mean + shift
     if strength < 1.0:

@@ -122,6 +122,42 @@ class SkinToneTests(unittest.TestCase):
         moved = np.abs(self._mean_lab(a) - self._mean_lab(b)).max()
         self.assertLess(moved, jump * 0.5)
 
+    def test_lifting_hand_does_not_change_face_colour(self):
+        src = self._face((150, 170, 220))
+        c = np.array([300.0, 200.0])
+        for i in range(30):
+            ref = st.match_skin_tone(src, self._face((70, 110, 160), i), c, 200)
+        base = self._mean_lab(ref)
+        for cover in (0.3, 0.6, 0.9):
+            tgt = self._face((70, 110, 160), 77)
+            h = int(128 * cover)
+            tgt[128 - h:] = self._face((140, 160, 225), 78)[128 - h:]   # hand coming up
+            for _ in range(10):
+                out = st.match_skin_tone(src, tgt, c, 200)
+            self.assertLess(np.abs(self._mean_lab(out) - base).max(), 3, f"hand covering {cover:.0%}")
+
+    def test_relearns_after_lighting_change(self):
+        src = self._face((150, 170, 220))
+        c = np.array([300.0, 200.0])
+        for i in range(30):
+            st.match_skin_tone(src, self._face((70, 110, 160), i), c, 200)
+        for i in range(80):
+            out = st.match_skin_tone(src, self._face((110, 150, 200), 200 + i), c, 200)
+        want = st.match_skin_tone(src, self._face((110, 150, 200), 999))
+        self.assertLess(np.abs(self._mean_lab(out) - self._mean_lab(want)).max(), 3)
+
+    def test_keeps_picture_colour_detail(self):
+        # lips/makeup: colour variation in the picture must survive
+        src = self._face((150, 170, 220))
+        src[60:70, 30:100] = (60, 60, 200)       # red stripe across the cheeks
+        tgt = self._face((70, 110, 160), 1)
+        out = st.match_skin_tone(src, tgt)
+        lab_in = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(float)
+        lab_out = cv2.cvtColor(out, cv2.COLOR_BGR2LAB).astype(float)
+        contrast_in = lab_in[60:70, 30:100, 1].mean() - lab_in[80:90, 30:100, 1].mean()
+        contrast_out = lab_out[60:70, 30:100, 1].mean() - lab_out[80:90, 30:100, 1].mean()
+        self.assertGreater(contrast_out, contrast_in * 0.9)
+
     def test_shape_mismatch_returns_input(self):
         src = self._face((150, 170, 220))
         self.assertIs(st.match_skin_tone(src, np.zeros((64, 64, 3), np.uint8)), src)

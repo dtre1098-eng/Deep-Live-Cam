@@ -34,6 +34,7 @@ poisson_blend: bool = False      # Enable Poisson Blending for smoother face swa
 color_correction: bool = False   # Enable color correction (implementation specific)
 skin_tone_match: bool = True     # Match swapped face skin tone/lighting to the real face/body
 skin_tone_strength: float = 1.0  # 0..1 amount of skin tone correction
+face_detail: float = 0.8         # 0..1.5 detail/sharpness kept when the swapped face is enlarged (0 = off)
 hair_transfer: bool = True      # Overlay the source picture's hair on the swapped face
 hide_real_hair: bool = True     # Live: paint learned background over your own hair so only the source hair shows
 face_stabilization: bool = True  # Live: smooth/track the face so the swap stays locked on while moving
