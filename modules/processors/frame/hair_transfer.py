@@ -191,7 +191,14 @@ def get_layer(source_path: Optional[str], source_face: Any) -> Optional[HairLaye
         mtime = os.path.getmtime(source_path)
     except OSError:
         return None
-    key = (source_path, mtime, np.round(np.asarray(kps, np.float32), 1).tobytes())
+    mask_mtimes = tuple(
+        os.path.getmtime(c) if os.path.exists(c) else 0.0
+        for c in (os.path.splitext(source_path)[0] + ".hair.png", source_path + ".hair.png")
+    )
+    # Re-checked every frame (two cheap stat calls) so a mask edited with
+    # tools/make_hair_mask.py is picked up without restarting the app.
+    key = (source_path, mtime, mask_mtimes,
+           np.round(np.asarray(kps, np.float32), 1).tobytes())
     with _LOCK:
         if _CACHE["key"] == key:
             return _CACHE["layer"]
