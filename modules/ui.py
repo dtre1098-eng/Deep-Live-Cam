@@ -66,6 +66,7 @@ from modules.face_analyser import (
     simplify_maps,
 )
 from modules.gettext import LanguageManager
+from modules.live_tracking import FaceTracker
 from modules.gpu_processing import gpu_cvt_color, gpu_flip, gpu_resize
 from modules.processors.frame.core import get_frame_processors_modules
 from modules.utilities import (
@@ -318,6 +319,8 @@ def save_switch_states():
         "map_faces": modules.globals.map_faces,
         "poisson_blend": modules.globals.poisson_blend,
         "color_correction": modules.globals.color_correction,
+        "skin_tone_match": modules.globals.skin_tone_match,
+        "face_stabilization": modules.globals.face_stabilization,
         "nsfw_filter": modules.globals.nsfw_filter,
         "live_mirror": modules.globals.live_mirror,
         "live_resizable": modules.globals.live_resizable,
@@ -345,9 +348,11 @@ def load_switch_states():
         modules.globals.map_faces = state.get("map_faces", False)
         modules.globals.poisson_blend = state.get("poisson_blend", False)
         modules.globals.color_correction = state.get("color_correction", False)
+        modules.globals.skin_tone_match = state.get("skin_tone_match", True)
+        modules.globals.face_stabilization = state.get("face_stabilization", True)
         modules.globals.nsfw_filter = state.get("nsfw_filter", False)
         modules.globals.live_mirror = state.get("live_mirror", False)
-        modules.globals.live_resizable = state.get("live_resizable", False)
+        modules.globals.live_resizable = state.get("live_resizable", True)
         modules.globals.fp_ui = state.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = state.get("show_fps", False)
         # Mouth mask always starts disabled (slider at 0) on launch,
@@ -604,6 +609,10 @@ class MainWindow(QMainWindow):
                                "Blend face edges smoothly using Poisson blending")
         self.sw_color_fix = make("color_correction", "Fix Blueish Cam",
                                  "Fix blue/green color cast from some webcams")
+        self.sw_skin_tone = make("skin_tone_match", "Match Skin Tone",
+                                 "Match the swapped face's skin tone and lighting to your real face/body")
+        self.sw_stabilize = make("face_stabilization", "Stabilize Face",
+                                 "Live: track and smooth the face so the swap stays on while you move")
         self.sw_show_fps = make("show_fps", "Show FPS",
                                 "Display frames-per-second counter on the live preview")
 
@@ -618,6 +627,7 @@ class MainWindow(QMainWindow):
             self.sw_keep_frames, self.sw_many_faces,
             self.sw_map_faces, self.sw_show_fps,
             self.sw_poisson, self.sw_color_fix,
+            self.sw_skin_tone, self.sw_stabilize,
         ]
         for i, w in enumerate(items):
             grid.addWidget(w, i // 2, i % 2)
@@ -1067,6 +1077,8 @@ class _ProcessingWorker(QThread):
         cached_target_face = None
         cached_many_faces = None
         det_interval = max(1, round(self._fps * 0.08))
+        tracker = FaceTracker(max_faces=1)
+        tracker_many = None
 
         while not self._stop.is_set():
             try:
@@ -1087,7 +1099,39 @@ class _ProcessingWorker(QThread):
                     source_image = get_one_face(imread_unicode(modules.globals.source_path))
 
                 det_count += 1
-                if det_count % det_interval == 0:
+                # Detect on the very first frame too (det_count starts at 1),
+                # otherwise the first det_interval-1 frames are never swapped.
+                run_detection = det_count % det_interval == 0 or det_count == 1
+                if modules.globals.face_stabilization:
+                    # Tracked path: smooth keypoints, follow the face between
+                    # detections and hold it briefly through missed
+                    # detections, so the swap (and hairline blend) doesn't
+                    # slide, drop out or flicker when moving closer/farther.
+                    if modules.globals.many_faces:
+                        if tracker_many is None:
+                            tracker_many = FaceTracker(max_faces=8)
+                        active = tracker_many
+                        tracker.reset()
+                    else:
+                        active = tracker
+                        if tracker_many is not None:
+                            tracker_many.reset()
+                    if run_detection:
+                        dets = detect_many_faces_fast(temp_frame)
+                        # Landmarks on the real detections (once per detection
+                        # cycle); the tracker carries them along, shifted.
+                        if modules.globals.mouth_mask and dets:
+                            ensure_landmarks(temp_frame, dets)
+                        tracked = active.update(dets)
+                    else:
+                        tracked = active.predict()
+                    if modules.globals.many_faces:
+                        cached_target_face = None
+                        cached_many_faces = tracked or None
+                    else:
+                        cached_target_face = tracked[0] if tracked else None
+                        cached_many_faces = None
+                elif run_detection:
                     if modules.globals.many_faces:
                         cached_target_face = None
                         cached_many_faces = detect_many_faces_fast(temp_frame)
