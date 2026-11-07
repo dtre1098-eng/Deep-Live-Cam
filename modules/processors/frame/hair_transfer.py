@@ -105,6 +105,20 @@ def segment_hair(image: np.ndarray, kps: np.ndarray) -> np.ndarray:
     except cv2.error:
         return np.zeros(image.shape[:2], np.uint8)
     fg = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    # Background colours come from a zoomed-out view (eye distance 24px) so
+    # the whole picture away from the person is sampled, not just the
+    # pixels right around the head.
+    Sw = 24.0 / eye_d
+    Mw = cv2.getRotationMatrix2D((float(eye_c[0]), float(eye_c[1])), angle, Sw)
+    Mw[:, 2] += np.array([192.0, 160.0]) - eye_c
+    wide = cv2.warpAffine(image, Mw, (N, N), flags=cv2.INTER_AREA, borderValue=0)
+    wide_in = cv2.warpAffine(np.full(image.shape[:2], 255, np.uint8), Mw, (N, N),
+                             flags=cv2.INTER_NEAREST, borderValue=0) > 0
+    far = np.full((N, N), 255, np.uint8)
+    cv2.ellipse(far, (192, 150), (80, 92), 0, 0, 360, 0, -1)          # head + hair (~3.5 eye dist)
+    cv2.rectangle(far, (192 - 85, 195), (192 + 85, N), 0, -1)          # shoulders / long hair
+    bg_px = cv2.cvtColor(wide, cv2.COLOR_BGR2LAB)[(far > 0) & wide_in]
+    fg = _drop_background_colours(norm, fg, bg_px)
 
     # Clean up: close small gaps, drop specks, keep the blob(s) touching the head.
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
@@ -122,6 +136,55 @@ def segment_hair(image: np.ndarray, kps: np.ndarray) -> np.ndarray:
     Minv = cv2.invertAffineTransform(M)
     return cv2.warpAffine(keep, Minv, (image.shape[1], image.shape[0]),
                           flags=cv2.INTER_LINEAR, borderValue=0)
+
+
+def _kmeans_centres(px: np.ndarray, k: int, min_share: float = 0.0) -> np.ndarray:
+    px = px.astype(np.float32)
+    if len(px) > 6000:
+        px = px[np.random.default_rng(0).choice(len(px), 6000, replace=False)]
+    k = max(1, min(k, len(px)))
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    cv2.setRNGSeed(0)
+    _, labels, centres = cv2.kmeans(px, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    if min_share > 0:
+        share = np.bincount(labels.ravel(), minlength=k) / len(labels)
+        major = share >= min_share
+        if major.any():
+            centres = centres[major]
+    return centres
+
+
+def _drop_background_colours(norm: np.ndarray, fg: np.ndarray, bg_px: np.ndarray) -> np.ndarray:
+    """Remove pixels from the hair cut-out that look like the photo's background.
+
+    GrabCut alone happily takes in background patches next to the hair
+    (dark walls next to dark hair, objects behind the shoulders). Here the
+    hair colours are learnt from the crown, the background colours from the
+    area well away from the person, and every cut-out pixel that is closer
+    to a background colour than to a hair colour is dropped, so none of the
+    picture's background comes along with the hair.
+    """
+    N = norm.shape[0]
+    lab = cv2.cvtColor(norm, cv2.COLOR_BGR2LAB).astype(np.float32)
+    crown = np.zeros((N, N), np.uint8)
+    cv2.ellipse(crown, (192, 92), (60, 32), 0, 0, 360, 255, -1)  # just above the forehead
+    hair_seed = (crown > 0) & (cv2.erode(fg, np.ones((9, 9), np.uint8)) > 0)
+    if hair_seed.sum() < 80 or len(bg_px) < 200:
+        return fg
+    # Main hair colours only: a background object touching the top of the
+    # head would otherwise sneak in as a minor "hair" colour.
+    hair_c = _kmeans_centres(lab[hair_seed], 4, min_share=0.2)
+    bg_c = _kmeans_centres(bg_px, 12)
+    cand = fg > 0
+    px = lab[cand]
+    d_h = np.min(np.linalg.norm(px[:, None, :] - hair_c[None], axis=2), axis=1)
+    d_b = np.min(np.linalg.norm(px[:, None, :] - bg_c[None], axis=2), axis=1)
+    # Keep only clearly-hair pixels: nearer to hair than to background (with
+    # a margin) and not wildly off every hair colour.
+    keep = (d_h < d_b * 0.85) & (d_h < 40)
+    out = np.zeros_like(fg)
+    out[cand] = np.where(keep, 255, 0)
+    return out
 
 
 def build_layer(image: np.ndarray, kps: np.ndarray,
