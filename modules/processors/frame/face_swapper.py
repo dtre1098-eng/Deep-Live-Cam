@@ -564,10 +564,11 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
     if not isinstance(bgr_fake, np.ndarray):
         return temp_frame
-    return paste_swapped_face(temp_frame, bgr_fake, M, target_face)
+    return paste_swapped_face(temp_frame, bgr_fake, M, target_face, source_face)
 
 
-def paste_swapped_face(temp_frame: Frame, bgr_fake: np.ndarray, M: np.ndarray, target_face: Face) -> Frame:
+def paste_swapped_face(temp_frame: Frame, bgr_fake: np.ndarray, M: np.ndarray, target_face: Face,
+                       source_face: Optional[Face] = None) -> Frame:
     """Paste the swap model's aligned output back onto ``temp_frame``.
 
     ``M`` is the alignment of ``target_face`` in ``temp_frame``. The mouth
@@ -757,7 +758,7 @@ class AsyncLiveSwapper:
         # A result made for a previous source image must not be pasted.
         if result is None or result[0] is not source_face:
             return frame
-        return paste_swapped_face(frame, result[1], M, target_face)
+        return paste_swapped_face(frame, result[1], M, target_face, source_face)
 
     def clear(self) -> None:
         """Forget the current result and any waiting crop, e.g. because the
