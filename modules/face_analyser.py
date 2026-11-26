@@ -205,6 +205,13 @@ def detect_one_face_fast(frame: Frame) -> Any:
     return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
 
 
+def is_cpu_only() -> bool:
+    """True when no graphics-card execution provider is in use."""
+    providers = [p[0] if isinstance(p, tuple) else p
+                 for p in (modules.globals.execution_providers or [])]
+    return all(p == "CPUExecutionProvider" for p in providers)
+
+
 def detect_many_faces_fast(frame: Frame) -> Any:
     """Detection-only multi-face — skips landmark and recognition."""
     from insightface.app.common import Face

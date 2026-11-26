@@ -63,6 +63,7 @@ from modules.face_analyser import (
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     has_valid_map,
+    is_cpu_only,
     reset_face_analyser,
     simplify_maps,
 )
@@ -1236,6 +1237,12 @@ class _ProcessingWorker(QThread):
         cached_target_face = None
         cached_many_faces = None
         det_interval = max(1, round(self._fps * 0.08))
+        # Processor only (no graphics card): detect less often -- the tracker
+        # predicts the face in between -- so more CPU is left for the swap.
+        cpu_only = is_cpu_only()
+        if cpu_only:
+            print("[DLC.LIVE] No graphics card in use. For speed: set 'Det size' to 320 x 320 "
+                  "and turn on 'Async swap'.")
         tracker = FaceTracker(max_faces=1)
         tracker_many = None
         bg_plate = BackgroundPlate()
@@ -1286,7 +1293,10 @@ class _ProcessingWorker(QThread):
                 det_count += 1
                 # Detect on the very first frame too (det_count starts at 1),
                 # otherwise the first det_interval-1 frames are never swapped.
-                run_detection = det_count % det_interval == 0 or det_count == 1
+                interval = det_interval
+                if cpu_only and modules.globals.face_stabilization:
+                    interval = max(det_interval, round(self._fps * 0.15))
+                run_detection = det_count % interval == 0 or det_count == 1
                 if modules.globals.face_stabilization:
                     # Tracked path: smooth keypoints, follow the face between
                     # detections and hold it briefly through missed
