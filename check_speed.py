@@ -91,6 +91,11 @@ def main():
     try:
         import onnxruntime as ort
         provs = ort.get_available_providers()
+        if "CUDAExecutionProvider" in provs and hasattr(ort, "preload_dlls"):
+            try:
+                ort.preload_dlls(cuda=True, cudnn=True, msvc=True)  # pip-installed CUDA/cuDNN
+            except Exception as e:
+                out(f"Could not load NVIDIA CUDA libraries: {e}")
     except Exception as e:
         out(f"Could not load onnxruntime: {e}")
         return
@@ -129,7 +134,8 @@ def main():
         gpu = {k: v for k, v in results.items() if k != "CPUExecutionProvider"}
         if not gpu:
             out("RESULT: only the CPU works. That is why Live is slow.")
-            out("  - NVIDIA card: install the GPU build (see README), then start with run-cuda.bat")
+            out("  - NVIDIA card: run   python -m pip install \"onnxruntime-gpu[cuda,cudnn]==1.26.0\" nvidia-cublas-cu12")
+            out("    then start with run-cuda.bat")
             out("  - AMD/Intel card: install onnxruntime-directml, then start with run-directml.bat")
             out("  - Or turn on 'Async swap' so the preview stays smooth on the CPU.")
         else:
