@@ -178,11 +178,31 @@ def detect_one_face_fast(frame: Frame) -> Any:
     return Face(bbox=bboxes[idx, :4], kps=kpss[idx], det_score=bboxes[idx, 4])
 
 
-def detect_many_faces_fast(frame: Frame) -> Any:
-    """Detection-only multi-face — skips landmark and recognition."""
+# Live camera on the processor only (no graphics card): look for faces at
+# 320x320 instead of 640x640 -- about 4x less work. Webcam faces are large,
+# and the live tracker fills in between detections.
+CPU_LIVE_DET_SIZE = (320, 320)
+
+
+def is_cpu_only() -> bool:
+    """True when no graphics-card execution provider is in use."""
+    providers = [p[0] if isinstance(p, tuple) else p
+                 for p in (modules.globals.execution_providers or [])]
+    return all(p == "CPUExecutionProvider" for p in providers)
+
+
+def detect_many_faces_fast(frame: Frame, input_size: Any = None) -> Any:
+    """Detection-only multi-face — skips landmark and recognition.
+
+    ``input_size`` (w, h) overrides the detector's resolution for this call
+    (used by the live preview to detect faster on the CPU).
+    """
     from insightface.app.common import Face
     fa = get_face_analyser()
-    bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
+    if input_size is not None:
+        bboxes, kpss = fa.det_model.detect(frame, input_size=input_size, max_num=0, metric='default')
+    else:
+        bboxes, kpss = fa.det_model.detect(frame, max_num=0, metric='default')
     if bboxes.shape[0] == 0:
         return None
     return [Face(bbox=bboxes[i, :4], kps=kpss[i], det_score=bboxes[i, 4])
