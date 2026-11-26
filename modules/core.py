@@ -17,6 +17,28 @@ try:
 except ImportError:
     HAS_TORCH = False
 import onnxruntime
+
+
+def _preload_nvidia_libraries() -> None:
+    """Load NVIDIA CUDA/cuDNN libraries installed with pip, if present.
+
+    onnxruntime-gpu needs CUDA 12 + cuDNN 9 (cublasLt64_12.dll etc.). They
+    can be installed without the CUDA Toolkit via
+        pip install "onnxruntime-gpu[cuda,cudnn]"
+    but then onnxruntime must be told to load them, which this does. Without
+    it the graphics card is silently skipped and everything runs on the CPU.
+    """
+    try:
+        import importlib.util
+        if (hasattr(onnxruntime, "preload_dlls")
+                and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                and importlib.util.find_spec("nvidia") is not None):
+            onnxruntime.preload_dlls(cuda=True, cudnn=True, msvc=True)
+    except Exception as e:  # never stop the app over this
+        print(f"[DLC.CORE] Could not preload NVIDIA libraries: {e}")
+
+
+_preload_nvidia_libraries()
 try:
     import tensorflow
     HAS_TENSORFLOW = True
